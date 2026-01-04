@@ -3,6 +3,7 @@
 Spring Boot 기반의 간단하고 확장 가능한 결제 시스템 API
 
 ## 목차
+- [Feature 브랜치 설계 개선 사항](#feature-브랜치-설계-개선-사항)
 - [프로젝트 개요](#프로젝트-개요)
 - [기술 스택](#기술-스택)
 - [주요 기능](#주요-기능)
@@ -11,6 +12,168 @@ Spring Boot 기반의 간단하고 확장 가능한 결제 시스템 API
 - [실행 방법](#실행-방법)
 - [API 명세](#api-명세)
 - [테스트](#테스트)
+
+## Feature 브랜치 설계 개선 사항
+
+이 섹션은 main 브랜치에서 feature 브랜치로 전환하며 추가 구현한 설계 개선 사항과 그 논리적 근거를 설명해보려고 합니다.
+
+### 1. 할인 이력 추적 시스템 (DiscountHistory)
+
+**구현 내용**
+- `DiscountHistory` 엔티티를 도입하여 모든 할인 적용 내역을 데이터베이스에 영구 저장
+- Payment와 1:N 관계를 설정하여 하나의 결제에 여러 할인 정책이 적용될 수 있도록 설계
+- 할인 정책명, 할인율/금액, 적용 순서, 할인 기준 금액 등을 상세하게 기록
+
+**설계 변경 근거**
+
+main 브랜치에서는 Payment 엔티티에 `discountAmount` 필드만 존재하여 "최종 할인 금액"만 알 수 있었습니다. 이는 다음과 같은 한계가 있었습니다
+
+1. **감사 추적(Audit Trail) 불가능**
+  - 어떤 할인 정책이 적용되었는지 추적 불가
+  - 고객 문의 시 할인 적용 내역을 설명할 수 없음
+  - 정산 및 회계 감사 시 할인 근거 제시 불가
+
+2. **분쟁 해결 불가**
+  - "왜 이 금액만큼 할인되었나요?" 라는 고객 문의에 답변 불가
+  - 할인 정책 오류 발생 시 원인 분석 불가
+
+3. **비즈니스 분석 제한**
+  - 어떤 할인 정책이 가장 많이 사용되는지 분석 불가
+  - 할인 정책별 ROI 측정 불가
+  - 등급별/결제수단별 할인 효과 분석 불가
+
+**개선 효과**
+
+```java
+// feature 브랜치: 할인 이력 상세 추적
+DiscountHistory gradeDiscount = DiscountHistory.createGradeDiscount(
+    payment,
+    "VVIP 10% 할인",      // 정책명
+    new BigDecimal("10.00"),  // 할인율
+    discountAmount,           // 할인 금액
+    MemberGrade.VVIP,        // 회원 등급
+    1,                       // 적용 순서
+    baseAmount               // 할인 기준 금액
+);
+```
+
+- 모든 할인 정책이 언제, 어떻게 적용되었는지 완전한 추적 가능
+- 고객 문의 대응 및 정산 프로세스 투명성 확보
+- 할인 정책 효과 분석을 통한 마케팅 최적화 가능
+
+**관련 파일**
+- `src/main/java/com/polycube/domain/DiscountHistory.java`
+- `src/main/java/com/polycube/repository/DiscountHistoryRepository.java`
+- `src/main/java/com/polycube/dto/DiscountHistoryResponse.java`
+
+### 2. 다중 할인 정책 순차 적용
+
+**구현 내용**
+- 등급 할인(1차)과 결제 수단 할인(2차)을 순차적으로 중복 적용
+- 포인트 결제 시 등급 할인 후 금액에서 추가 5% 할인 적용
+- 각 할인 단계마다 DiscountHistory에 이력 저장
+
+**설계 변경 근거**
+
+main 브랜치에서는 단일 할인 정책만 적용 가능했습니다. 그러나 실무 시나리오를 고려하면:
+
+1. **실제 비즈니스 요구사항**
+  - 대부분의 이커머스는 회원 등급 할인 + 결제 수단 할인 + 쿠폰 할인 등 다중 할인을 제공
+  - 예: "VVIP 10% 할인 + 포인트 결제 5% 추가 할인"
+
+2. **할인 적용 순서의 중요성**
+  - 순서에 따라 최종 금액이 달라질 수 있음
+  - 명확한 적용 순서 규칙이 필요
+
+3. **확장성 고려**
+  - 향후 쿠폰, 프로모션 등 추가 할인 정책 도입 시 대응 가능한 구조 필요
+
+**할인 적용 로직**
+
+```java
+// 1단계: 등급 할인 (기준 금액: 원가)
+BigDecimal gradeDiscountAmount = discountPolicy.discount(member, baseAmount);
+BigDecimal amountAfterGradeDiscount = baseAmount.subtract(gradeDiscountAmount);
+
+// 2단계: 결제 수단 할인 (기준 금액: 등급 할인 후 금액)
+if (paymentMethod == PaymentMethod.POINT) {
+    paymentMethodDiscountAmount = amountAfterGradeDiscount
+        .multiply(new BigDecimal("0.05"))
+        .setScale(2, RoundingMode.HALF_UP);
+}
+
+// 최종 금액 계산
+BigDecimal finalAmount = amountAfterGradeDiscount.subtract(paymentMethodDiscountAmount);
+```
+
+**중요하게 생각한 점**
+
+1. **할인 적용 순서의 명확성**: 등급 할인 → 결제 수단 할인 순서로 고정
+2. **각 단계별 이력 저장**: 감사 추적을 위해 각 할인마다 별도의 DiscountHistory 생성
+3. **소수점 처리**: `RoundingMode.HALF_UP`으로 일관된 반올림 처리
+4. **확장 가능한 구조**: 새로운 할인 정책 추가 시 기존 로직 수정 최소화
+
+**개선 효과**
+- 실무에 가까운 할인 시나리오 구현
+- 할인 정책 확장 시 기존 코드 수정 없이 새 할인 단계 추가 가능
+- 각 할인 단계별 금액 추적으로 정산 및 분석 용이
+
+**관련 파일**
+- `src/main/java/com/polycube/service/PaymentService.java` (createPayment 메서드)
+
+### 3. 데이터 무결성 및 비즈니스 로직 검증 테스트 강화
+
+**구현 내용**
+- `PaymentDataIntegrityTest`: 할인 이력 데이터 무결성 검증
+- `PaymentServiceMultipleDiscountTest`: 다중 할인 적용 시나리오 통합 테스트
+
+**설계 변경 근거**
+
+main 브랜치의 테스트는 단일 할인 정책 검증에 집중되어 있었습니다. feature 브랜치에서 할인 이력 추적과 다중 할인을 도입하면서 다음 테스트가 필수적이었습니다
+
+1. **데이터 무결성 보장**
+   ```java
+   // Payment와 DiscountHistory 간의 관계 검증
+   @Test
+   void 결제_생성시_할인_이력이_함께_저장되어야_함() {
+       // Payment 저장 시 연관된 DiscountHistory도 함께 저장되는지 검증
+       // cascade 설정이 올바른지 확인
+   }
+   ```
+
+2. **다중 할인 계산 정확성**
+   ```java
+   // VVIP + 포인트 결제 시나리오
+   // 원가 100,000원
+   // 1단계: VVIP 10% 할인 = 10,000원 → 90,000원
+   // 2단계: 포인트 5% 할인 = 4,500원 → 85,500원
+   // 총 할인: 14,500원, 최종 금액: 85,500원
+   ```
+
+3. **비즈니스 규칙 검증**
+  - 할인 이력의 적용 순서(applyOrder)가 올바른지 검증
+  - 각 할인의 기준 금액(baseAmount)이 정확한지 검증
+  - 할인 정책명과 할인 타입이 일치하는지 검증
+
+**중요하게 생각한 점**
+
+1. **실제 사용 시나리오 반영**: 단순한 단위 테스트보단 실제 API 호출 플로우와 유사한 통합 테스트
+2. **엣지 케이스 검증**: 할인 금액이 0인 경우, 여러 할인이 동시 적용되는 경우 등
+3. **데이터 일관성**: Payment의 총 할인 금액과 DiscountHistory의 할인 금액 합계가 일치하는지 검증
+
+**관련 파일**
+- `src/test/java/com/polycube/service/PaymentDataIntegrityTest.java`
+- `src/test/java/com/polycube/service/PaymentServiceMultipleDiscountTest.java`
+
+### 요약: main → feature 브랜치 핵심 개선 사항
+
+| 항목 | main 브랜치 | feature 브랜치 | 개선 효과 |
+|------|------------|----------------|----------|
+| 할인 추적 | 최종 할인 금액만 저장 | 모든 할인 이력 상세 저장 | 감사 추적, 분쟁 해결, 비즈니스 분석 가능 |
+| 할인 정책 | 단일 할인만 적용 | 다중 할인 순차 적용 | 실무 시나리오 반영, 확장성 향상 |
+| 테스트 | 기본 시나리오 검증 | 데이터 무결성 + 복합 시나리오 검증 | 안정성 및 신뢰성 향상 |
+
+이러한 개선을 통해 **실무에서 실제로 운영 가능한 수준의 결제 시스템**으로 제작하기 위해 노력했습니다.
 
 ## 프로젝트 개요
 
