@@ -1,14 +1,18 @@
 package com.polycube.service;
 
+import com.polycube.domain.DiscountHistory;
 import com.polycube.domain.Member;
 import com.polycube.domain.Order;
 import com.polycube.domain.Payment;
+import com.polycube.domain.enums.MemberGrade;
+import com.polycube.domain.enums.PaymentMethod;
 import com.polycube.domain.enums.PaymentStatus;
 import com.polycube.dto.PaymentRequest;
 import com.polycube.dto.PaymentResponse;
 import com.polycube.exception.InvalidPaymentStateException;
 import com.polycube.exception.OrderNotFoundException;
 import com.polycube.exception.PaymentNotFoundException;
+import com.polycube.repository.DiscountHistoryRepository;
 import com.polycube.repository.OrderRepository;
 import com.polycube.repository.PaymentRepository;
 import com.polycube.service.discount.MemberGradeDiscountPolicy;
@@ -18,6 +22,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -29,15 +34,19 @@ public class PaymentService {
 
     private final PaymentRepository paymentRepository;
     private final OrderRepository orderRepository;
+    private final DiscountHistoryRepository discountHistoryRepository;
     private final MemberGradeDiscountPolicy discountPolicy;
 
     /**
      * 결제 생성 (할인 적용)
+     * 1. 등급 할인 적용 (VVIP: 10%, VIP: 1000원)
+     * 2. 결제 수단 할인 적용 (포인트: 추가 5%)
+     * 3. 할인 이력 저장
      */
     @Transactional
     public PaymentResponse createPayment(PaymentRequest request) {
-        log.info("결제 생성 요청: orderId={}, amount={}, currency={}",
-                request.getOrderId(), request.getAmount(), request.getCurrency());
+        log.info("결제 생성 요청: orderId={}, amount={}, currency={}, paymentMethod={}",
+                request.getOrderId(), request.getAmount(), request.getCurrency(), request.getPaymentMethod());
 
         // 주문 조회
         Order order = orderRepository.findById(request.getOrderId())
@@ -51,18 +60,35 @@ public class PaymentService {
 
         // 주문으로부터 회원 정보 추출
         Member member = order.getMember();
+        BigDecimal baseAmount = request.getAmount();
 
-        // 할인 금액 계산
-        BigDecimal discountAmount = discountPolicy.discount(member, request.getAmount());
-        BigDecimal finalAmount = request.getAmount().subtract(discountAmount);
+        // 1. 등급 할인 계산
+        BigDecimal gradeDiscountAmount = discountPolicy.discount(member, baseAmount);
+        BigDecimal amountAfterGradeDiscount = baseAmount.subtract(gradeDiscountAmount);
 
-        log.info("할인 적용: 원가={}, 할인금액={}, 최종금액={}, 회원등급={}, memberId={}",
-                request.getAmount(), discountAmount, finalAmount, member.getGrade(), member.getId());
+        log.info("등급 할인 적용: 원가={}, 등급할인금액={}, 등급할인후금액={}, 회원등급={}",
+                baseAmount, gradeDiscountAmount, amountAfterGradeDiscount, member.getGrade());
 
+        // 2. 결제 수단 할인 계산 (포인트 결제 시 추가 5% 할인)
+        BigDecimal paymentMethodDiscountAmount = BigDecimal.ZERO;
+        if (request.getPaymentMethod() == PaymentMethod.POINT) {
+            paymentMethodDiscountAmount = amountAfterGradeDiscount
+                    .multiply(new BigDecimal("0.05"))
+                    .setScale(2, RoundingMode.HALF_UP);
+            log.info("결제 수단 할인 적용: 포인트 결제 5% 추가 할인={}", paymentMethodDiscountAmount);
+        }
+
+        // 최종 금액 계산
+        BigDecimal totalDiscountAmount = gradeDiscountAmount.add(paymentMethodDiscountAmount);
+        BigDecimal finalAmount = amountAfterGradeDiscount.subtract(paymentMethodDiscountAmount);
+
+        log.info("최종 할인 적용: 총할인금액={}, 최종결제금액={}", totalDiscountAmount, finalAmount);
+
+        // Payment 엔티티 생성
         Payment payment = Payment.builder()
                 .order(order)
-                .amount(request.getAmount())
-                .discountAmount(discountAmount)
+                .amount(baseAmount)
+                .discountAmount(totalDiscountAmount)
                 .finalAmount(finalAmount)
                 .currency(request.getCurrency())
                 .paymentMethod(request.getPaymentMethod())
@@ -71,9 +97,68 @@ public class PaymentService {
                 .build();
 
         Payment savedPayment = paymentRepository.save(payment);
+
+        // 3. 할인 이력 저장
+        // 3-1. 등급 할인 이력 저장
+        if (gradeDiscountAmount.compareTo(BigDecimal.ZERO) > 0) {
+            DiscountHistory gradeDiscountHistory = createGradeDiscountHistory(
+                    savedPayment, member, baseAmount, gradeDiscountAmount);
+            discountHistoryRepository.save(gradeDiscountHistory);
+            log.info("등급 할인 이력 저장: policyName={}, amount={}",
+                    gradeDiscountHistory.getPolicyName(), gradeDiscountAmount);
+        }
+
+        // 3-2. 결제 수단 할인 이력 저장
+        if (paymentMethodDiscountAmount.compareTo(BigDecimal.ZERO) > 0) {
+            DiscountHistory paymentMethodDiscountHistory = DiscountHistory.createPaymentMethodDiscount(
+                    savedPayment,
+                    "포인트 결제 5% 추가 할인",
+                    new BigDecimal("5.00"),
+                    paymentMethodDiscountAmount,
+                    request.getPaymentMethod(),
+                    2,
+                    amountAfterGradeDiscount
+            );
+            discountHistoryRepository.save(paymentMethodDiscountHistory);
+            log.info("결제 수단 할인 이력 저장: policyName=포인트 결제 5% 추가 할인, amount={}",
+                    paymentMethodDiscountAmount);
+        }
+
         log.info("결제 생성 완료: paymentId={}", savedPayment.getId());
 
         return PaymentResponse.from(savedPayment);
+    }
+
+    /**
+     * 등급 할인 이력 생성
+     */
+    private DiscountHistory createGradeDiscountHistory(Payment payment, Member member,
+                                                       BigDecimal baseAmount, BigDecimal discountAmount) {
+        MemberGrade grade = member.getGrade();
+
+        if (grade == MemberGrade.VVIP) {
+            return DiscountHistory.createGradeDiscount(
+                    payment,
+                    "VVIP 10% 할인",
+                    new BigDecimal("10.00"),
+                    discountAmount,
+                    grade,
+                    1,
+                    baseAmount
+            );
+        } else if (grade == MemberGrade.VIP) {
+            return DiscountHistory.createGradeDiscount(
+                    payment,
+                    "VIP 1,000원 고정 할인",
+                    null,
+                    discountAmount,
+                    grade,
+                    1,
+                    baseAmount
+            );
+        }
+
+        throw new IllegalStateException("할인이 적용되지 않는 등급입니다: " + grade);
     }
 
     /**

@@ -9,6 +9,7 @@ import com.polycube.domain.enums.PaymentStatus;
 import com.polycube.dto.PaymentRequest;
 import com.polycube.dto.PaymentResponse;
 import com.polycube.exception.OrderNotFoundException;
+import com.polycube.repository.DiscountHistoryRepository;
 import com.polycube.repository.OrderRepository;
 import com.polycube.repository.PaymentRepository;
 import com.polycube.service.discount.MemberGradeDiscountPolicy;
@@ -36,6 +37,9 @@ class PaymentServiceWithDiscountTest {
 
     @Mock
     private OrderRepository orderRepository;
+
+    @Mock
+    private DiscountHistoryRepository discountHistoryRepository;
 
     @Mock
     private MemberGradeDiscountPolicy discountPolicy;
