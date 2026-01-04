@@ -10,6 +10,8 @@ import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.stream.Collectors;
 
 @Data
 @NoArgsConstructor
@@ -28,6 +30,7 @@ public class PaymentResponse {
     private String description;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+    private List<DiscountHistoryResponse> discountHistories;
 
     public static PaymentResponse from(Payment payment) {
         return PaymentResponse.builder()
@@ -42,6 +45,11 @@ public class PaymentResponse {
                 .description(payment.getDescription())
                 .createdAt(payment.getCreatedAt())
                 .updatedAt(payment.getUpdatedAt())
+                .discountHistories(payment.getDiscountHistories() != null
+                        ? payment.getDiscountHistories().stream()
+                                .map(DiscountHistoryResponse::from)
+                                .collect(Collectors.toList())
+                        : List.of())
                 .build();
     }
 }
